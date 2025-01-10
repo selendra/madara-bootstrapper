@@ -3,9 +3,10 @@ use std::sync::Arc;
 
 use ethereum_instance::Error;
 use ethers::prelude::{abigen, Bytes, SignerMiddleware};
-use ethers::providers::{Http, Provider};
+use ethers::providers::{Http, Middleware, Provider};
 use ethers::signers::{LocalWallet, Signer};
 use ethers::types::{Address, U256};
+use tokio::time::{sleep, Duration};
 
 use crate::ConfigFile;
 
@@ -45,12 +46,34 @@ pub async fn upgrade_l1_bridge(ethereum_bridge_address: Address, config_file: &C
     let provider = Provider::<Http>::try_from(config_file.eth_rpc.clone()).map_err(|_| Error::UrlParser)?;
     let wallet: LocalWallet = config_file.eth_priv_key.parse().expect("Failed to parse private key");
     let signer_client =
-        Arc::new(SignerMiddleware::new(provider.clone(), wallet.with_chain_id(config_file.eth_chain_id)));
+        Arc::new(SignerMiddleware::new(provider.clone(), wallet.clone().with_chain_id(config_file.eth_chain_id)));
 
-    let new_eth_bridge_client = EthereumNewBridge::deploy(signer_client.clone(), ())?.send().await?;
+    // Get the initial nonce for the signer's address
+    let mut nonce = signer_client
+        .get_transaction_count(
+            signer_client.address(),
+            None, // None means latest block
+        )
+        .await?;
+
+    // Deploy new bridge with nonce
+    let new_eth_bridge_client = EthereumNewBridge::deploy(signer_client.clone(), ())?.nonce(nonce).send().await?;
+    nonce = nonce.saturating_add(1.into());
+
+    // let new_eth_bridge_client = EthereumNewBridge::deploy(signer_client.clone(), ())?.send().await?;
+
+    sleep(Duration::from_secs(20)).await;
     log::debug!("New ETH bridge deployed : {:?}", new_eth_bridge_client.address());
-    let eic_eth_bridge_client = EthereumNewBridgeEIC::deploy(signer_client.clone(), ())?.send().await?;
+
+    // let eic_eth_bridge_client = EthereumNewBridgeEIC::deploy(signer_client.clone(),
+    // ())?.send().await?; log::debug!("New ETH bridge EIC deployed : {:?}",
+    // eic_eth_bridge_client.address());
+
+    // Deploy EIC bridge with nonce
+    let eic_eth_bridge_client = EthereumNewBridgeEIC::deploy(signer_client.clone(), ())?.nonce(nonce).send().await?;
+    nonce = nonce.saturating_add(1.into());
     log::debug!("New ETH bridge EIC deployed : {:?}", eic_eth_bridge_client.address());
+    sleep(Duration::from_secs(10)).await;
 
     let eth_bridge_proxy_client = EthereumL1BridgeProxy::new(ethereum_bridge_address, signer_client.clone());
 
@@ -58,6 +81,7 @@ pub async fn upgrade_l1_bridge(ethereum_bridge_address: Address, config_file: &C
     let client_clone = eic_eth_bridge_client.clone();
     let address = client_clone.address();
     let eic_eth_bridge_bytes = address.as_ref();
+
     // let eic_eth_bridge_bytes = eic_eth_bridge_client.address().as_ref();
     let mut padded_eic_eth_bridge_address = Vec::with_capacity(32);
     padded_eic_eth_bridge_address.extend(vec![0u8; 32 - eic_eth_bridge_bytes.len()]);
@@ -68,32 +92,54 @@ pub async fn upgrade_l1_bridge(ethereum_bridge_address: Address, config_file: &C
 
     eth_bridge_proxy_client
         .add_implementation(new_eth_bridge_client.address(), call_data.clone(), false)
+        .nonce(nonce)
         .send()
         .await?;
+    nonce = nonce.saturating_add(1.into());
     log::debug!("New ETH bridge add_implementation ✅");
-    eth_bridge_proxy_client.upgrade_to(new_eth_bridge_client.address(), call_data, false).send().await?;
+    sleep(Duration::from_secs(10)).await;
+
+    eth_bridge_proxy_client.upgrade_to(new_eth_bridge_client.address(), call_data, false).nonce(nonce).send().await?;
+    nonce = nonce.saturating_add(1.into());
     log::debug!("New ETH bridge upgrade_to ✅");
+    sleep(Duration::from_secs(5)).await;
+
     new_eth_bridge_client
         .register_app_role_admin(Address::from_str(&config_file.l1_deployer_address.clone())?)
+        .nonce(nonce)
         .send()
         .await?;
+    nonce = nonce.saturating_add(1.into());
+    log::debug!("New ETH bridge register_app_role_admin ✅");
+    sleep(Duration::from_secs(10)).await;
+
     new_eth_bridge_client
         .register_governance_admin(Address::from_str(&config_file.l1_deployer_address.clone())?)
+        .nonce(nonce)
         .send()
         .await?;
+    nonce = nonce.saturating_add(1.into());
+    log::debug!("New ETH bridge register_governance_admin ✅");
+    sleep(Duration::from_secs(10)).await;
+
     new_eth_bridge_client
         .register_app_governor(Address::from_str(&config_file.l1_deployer_address.clone())?)
+        .nonce(nonce)
         .send()
         .await?;
+    nonce = nonce.saturating_add(1.into());
+    log::debug!("New ETH bridge register_app_governor ✅");
+    sleep(Duration::from_secs(10)).await;
+
     new_eth_bridge_client
         .set_max_total_balance(
             Address::from_str("0x0000000000000000000000000000000000455448").unwrap(),
             U256::from_dec_str("10000000000000000000000000").unwrap(),
         )
+        .nonce(nonce)
         .send()
         .await?;
     log::debug!("New ETH bridge set_max_total_balance ✅");
-
     log::info!("Eth bridge L1 upgraded successfully ✅");
     Ok(())
 }
